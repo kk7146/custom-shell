@@ -12,6 +12,99 @@
 #define MAX_CMD_SIZE    (128)
 #define BASE_DIR "/private/tmp/test"
 
+void cp_func(const char *source, const char *destination) {
+    FILE *src_file = fopen(source, "r");
+    if (src_file == NULL) {
+        perror("cp (source)");
+        return;
+    }
+    FILE *dest_file = fopen(destination, "w");
+    if (dest_file == NULL) {
+        perror("cp (destination)");
+        fclose(src_file);
+        return;
+    }
+    char buffer[1024];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
+        fwrite(buffer, 1, bytes, dest_file);
+    }
+    fclose(src_file);
+    fclose(dest_file);
+    printf("File copied from %s to %s\n", source, destination);
+}
+
+void cat_func(char *filename) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        perror("cat");
+        return;
+    }
+    char line[1024];
+    while (fgets(line, sizeof(line), file) != NULL) {
+        printf("%s", line);
+    }
+    fclose(file);
+}
+void apply_symbolic_permissions(char *permissions, mode_t *mode) {
+    int user_flag = 0, group_flag = 0, other_flag = 0;
+    char *perm = permissions;
+    
+    if (*perm == 'u') { user_flag = 1; perm++; }
+    else if (*perm == 'g') { group_flag = 1; perm++; }
+    else if (*perm == 'o') { other_flag = 1; perm++; }
+    else { user_flag = group_flag = other_flag = 1; }
+
+    int add = (*perm == '+') ? 1 : (*perm == '-') ? 0 : -1;
+    perm++;
+    
+    while (*perm) {
+        if (*perm == 'r') {
+            if (user_flag) *mode = add ? (*mode | S_IRUSR) : (*mode & ~S_IRUSR);
+            if (group_flag) *mode = add ? (*mode | S_IRGRP) : (*mode & ~S_IRGRP);
+            if (other_flag) *mode = add ? (*mode | S_IROTH) : (*mode & ~S_IROTH);
+        } else if (*perm == 'w') {
+            if (user_flag) *mode = add ? (*mode | S_IWUSR) : (*mode & ~S_IWUSR);
+            if (group_flag) *mode = add ? (*mode | S_IWGRP) : (*mode & ~S_IWGRP);
+            if (other_flag) *mode = add ? (*mode | S_IWOTH) : (*mode & ~S_IWOTH);
+        } else if (*perm == 'x') {
+            if (user_flag) *mode = add ? (*mode | S_IXUSR) : (*mode & ~S_IXUSR);
+            if (group_flag) *mode = add ? (*mode | S_IXGRP) : (*mode & ~S_IXGRP);
+            if (other_flag) *mode = add ? (*mode | S_IXOTH) : (*mode & ~S_IXOTH);
+        }
+        perm++;
+    }
+}
+
+void chmod_func(char *perm_str, char *filename) {
+    struct stat statbuf;
+    mode_t mode;
+
+    if (stat(filename, &statbuf) != 0) {
+        perror("stat");
+        return;
+    }
+    mode = statbuf.st_mode;
+
+    if (perm_str[0] >= '0' && perm_str[0] <= '7') {
+
+        mode_t new_mode = strtol(perm_str, NULL, 8);
+        if (chmod(filename, new_mode) != 0) {
+            perror("chmod");
+        } else {
+            printf("Permissions changed to %o for %s\n", new_mode, filename);
+        }
+    } else {
+
+        apply_symbolic_permissions(perm_str, &mode);
+        if (chmod(filename, mode) != 0) {
+            perror("chmod");
+        } else {
+            printf("Permissions changed for %s\n", filename);
+        }
+    }
+}
+
 int validate_path(char path[MAX_CMD_SIZE]) {
     char absolute_path[128];
     if (realpath(path, absolute_path) == NULL) {
@@ -34,19 +127,24 @@ char* resolve_path(const char *path) {
 
 void show_help() {
     printf("Available commands:\n");
-    printf("help                : Show this help message\n");
-    printf("cd <path>          : Change directory\n");
-    printf("mkdir <path>       : Create a directory\n");
-    printf("rmdir <path>       : Remove a directory\n");
-    printf("rename <source> <target> : Rename a directory\n");
-    printf("ln <original> <new>: Create a hard link\n");
-    printf("rm <file>          : Remove a file\n");
-    printf("ls                 : List current directory contents\n");
-    printf("quit               : Exit the shell\n");
+    printf("help                   : Show this help message\n");
+    printf("cd <path>              : Change directory to <path>\n");
+    printf("mkdir <path>           : Create a new directory at <path>\n");
+    printf("rmdir <path>           : Remove the directory at <path>\n");
+    printf("rename <source> <target> : Rename <source> to <target>\n");
+    printf("ln <original> <new>    : Create a hard link from <new> to <original>\n");
+    printf("ln -s <original> <new> : Create a symbolic link from <new> to <original>\n");
+    printf("chmod <perm> <file>    : Change <file> permissions, e.g., 0644 or u+rwx\n");
+    printf("cat <filename>         : Display the contents of <filename>\n");
+    printf("cp <source> <dest>     : Copy <source> file to <dest>\n");
+    printf("rm <file>              : Remove the specified <file>\n");
+    printf("ls                     : List contents of the current directory with details\n");
+    printf("quit                   : Exit the shell\n");
 }
 
 void print_permissions(mode_t mode) {
-    printf((S_ISDIR(mode)) ? "d" : "-");
+    printf((S_ISDIR(mode)) ? "d" : (S_ISLNK(mode)) ? "l" : (S_ISFIFO(mode)) ? "p" :
+           (S_ISCHR(mode)) ? "c" : (S_ISBLK(mode)) ? "b" : (S_ISSOCK(mode)) ? "s" : "-");
     printf((mode & S_IRUSR) ? "r" : "-");
     printf((mode & S_IWUSR) ? "w" : "-");
     printf((mode & S_IXUSR) ? "x" : "-");
@@ -65,27 +163,40 @@ void ls_func() {
     struct passwd *pw;
     struct group *gr;
     char timebuf[64];
+    char link_target[MAX_CMD_SIZE + 1];
+
     dir = opendir(".");
     if (dir == NULL) {
         perror("ls");
         return;
     }
+    
     while ((entry = readdir(dir)) != NULL) {
-        if (stat(entry->d_name, &statbuf) == -1) {
-            perror("stat");
+        if (lstat(entry->d_name, &statbuf) == -1) {
+            perror("lstat");
             continue;
         }
         print_permissions(statbuf.st_mode);
-        printf(" %hd ", statbuf.st_nlink);
+        printf(" %ld ", (long)statbuf.st_nlink);
         pw = getpwuid(statbuf.st_uid);
         gr = getgrgid(statbuf.st_gid);
         printf("%s %s ", pw->pw_name, gr->gr_name);
-        printf("%5lld ", statbuf.st_size);
+        printf("%5lld ", (long long)statbuf.st_size);
         strftime(timebuf, sizeof(timebuf), "%b %d %H:%M", localtime(&statbuf.st_atime));
         printf("Access: %s ", timebuf);
         strftime(timebuf, sizeof(timebuf), "%b %d %H:%M", localtime(&statbuf.st_mtime));
         printf("Modify: %s ", timebuf);
-        printf("%s\n", entry->d_name);
+        strftime(timebuf, sizeof(timebuf), "%b %d %H:%M", localtime(&statbuf.st_ctime));
+        printf("Create: %s ", timebuf);
+        printf("%s", entry->d_name);
+        if (S_ISLNK(statbuf.st_mode)) {
+            ssize_t len = readlink(entry->d_name, link_target, sizeof(link_target) - 1);
+            if (len != -1) {
+                link_target[len] = '\0';
+                printf(" -> %s", link_target);
+            }
+        }
+        printf("\n");
     }
     closedir(dir);
 }
@@ -163,14 +274,29 @@ int main(int argc, char **argv) {
                 rename(src, dest);
             }
         } else if (strcmp(tok_str, "ln") == 0) {
-            char *original = strtok(NULL, " \n");
-            char *new_link = strtok(NULL, " \n");
-            if (original == NULL || new_link == NULL) {
-                printf("ln: missing original or new link argument\n");
-            } else if (link(original, new_link) != 0) {
-                perror("ln");
+            char *option = strtok(NULL, " \n");
+            char *original = NULL;
+            char *new_link = NULL;
+            if (option && strcmp(option, "-s") == 0) {
+                original = strtok(NULL, " \n");
+                new_link = strtok(NULL, " \n");
+                if (original == NULL || new_link == NULL) {
+                    printf("ln: missing original or new link argument\n");
+                } else if (symlink(original, new_link) != 0) {
+                    perror("ln -s");
+                } else {
+                    printf("Symbolic link created: %s -> %s\n", new_link, original);
+                }
             } else {
-                printf("Hard link created: %s -> %s\n", new_link, original);
+                original = option;
+                new_link = strtok(NULL, " \n");
+                if (original == NULL || new_link == NULL) {
+                    printf("ln: missing original or new link argument\n");
+                } else if (link(original, new_link) != 0) {
+                    perror("ln");
+                } else {
+                    printf("Hard link created: %s -> %s\n", new_link, original);
+                }
             }
         } else if (strcmp(tok_str, "rm") == 0) {
             char *file = strtok(NULL, " \n");
@@ -181,9 +307,38 @@ int main(int argc, char **argv) {
             } else {
                 printf("File removed: %s\n", file);
             }
-        } else if (strcmp(tok_str, "ls") == 0)
+        } else if (strcmp(tok_str, "chmod") == 0) {
+            char *perm_str = strtok(NULL, " \n");
+            char *filename = strtok(NULL, " \n");
+            if (perm_str == NULL || filename == NULL) {
+                printf("chmod: missing permission or filename argument\n");
+            } else if (!validate_path(resolve_path(filename))) {
+                printf("chmod: invalid path\n");
+            } else {
+                chmod_func(perm_str, filename);
+            }
+        } else if (strcmp(tok_str, "ls") == 0) {
             ls_func();
-        else {
+        } else if (strcmp(tok_str, "cat") == 0) {
+            char *filename = strtok(NULL, " \n");
+            if (filename == NULL) {
+                printf("cat: missing filename argument\n");
+            } else if (!validate_path(resolve_path(filename))) {
+                printf("cat: invalid path\n");
+            } else {
+                cat_func(filename);
+            }
+        } else if (strcmp(tok_str, "cp") == 0) {
+            char *src = strtok(NULL, " \n");
+            char *dest = strtok(NULL, " \n");
+            if (src == NULL || dest == NULL) {
+                printf("cp: missing source or destination argument\n");
+            } else if (!validate_path(resolve_path(src)) || !validate_path(resolve_path(dest))) {
+                printf("cp: invalid path\n");
+            } else {
+                cp_func(src, dest);
+            }
+        } else {
             printf("your command: %s\n", tok_str);
             printf("and argument is ");
             tok_str = strtok(NULL, " \n");
@@ -192,7 +347,7 @@ int main(int argc, char **argv) {
             } else {
                 printf("%s\n", tok_str);
             }
-        }
+        } 
     } while (1);
     free(command);
     return 0;
